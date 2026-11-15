@@ -10,8 +10,9 @@
   let processing = false;
   let observerTimer = 0;
   let pageProgressTimer = 0;
+  let adaptReports100 = false;
 
-  // 1. Initial State & Storage Sync
+  // 1. Storage & State Sync
   chrome.storage.local.get(["autoEnabled"]).then((settings) => {
     autoEnabled = Boolean(settings.autoEnabled);
     if (autoEnabled) scheduleAutoRun(800);
@@ -24,16 +25,19 @@
     }
   });
 
-  // 2. Main-World Hook Injection (for 100% accurate Adapt data & completion)
+  // 2. Main-World Hook Injection
   injectMainWorldHook();
 
-  // Listen for internal course data passed by injected.js
   window.addEventListener("message", (event) => {
     if (event.source !== window || !event.data) return;
     
     if (event.data.marker === MESSAGE_MARKER && event.data.updates) {
       Object.assign(courseData, event.data.updates);
       if (autoEnabled && !processing) scheduleAutoRun(400);
+    }
+
+    if (event.data.marker === "NETACAD_PROGRESS_STATUS") {
+      adaptReports100 = Boolean(event.data.is100);
     }
 
     if (event.data.type === "NETACAD_TRIGGER_NEXT") {
@@ -56,7 +60,7 @@
     return false;
   });
 
-  // 4. DOM Observer to react to dynamically loaded SPA steps
+  // 4. DOM Observer
   const observer = new MutationObserver(() => {
     if (autoEnabled) scheduleAutoRun(1000);
   });
@@ -94,8 +98,7 @@
     retryObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
-  // Menangani interaksi halaman konten (Tab konten, Accordion)
-  // DIKECUALIKAN: Tab "Resources", "Course Outline", Navigasi Sidebar global agar tidak nyasar keluar
+  // Selesaikan interaktif dan paksa trigger complete
   async function completePageInteractives() {
     const interactives = queryAllDeep([
       ".accordion-item__title",
@@ -104,7 +107,6 @@
       ".media-btn",
       ".reveal-btn",
       ".narrative-slider-nav-btn",
-      // Hanya tab materi di dalam kontainer konten / article
       "article [role='tab']",
       ".component-tab [role='tab']",
       ".tabs__tab-title"
@@ -112,7 +114,6 @@
 
     for (const el of interactives) {
       const text = (el.innerText || el.getAttribute("aria-label") || "").trim().toLowerCase();
-      // JANGAN KLIK TAB RESOURCE / OUTLINE / HEADER SIDEBAR!
       if (/resource|outline|menu|search|daftar isi/i.test(text)) continue;
 
       if (isInViewport(el) && !el.classList.contains("visited") && !el.classList.contains("is-visited")) {
@@ -121,22 +122,51 @@
       }
     }
 
-    // Trigger Adapt internal complete event
     window.postMessage({ type: "FORCE_ADAPT_COMPLETE" }, "*");
 
-    // Scroll perlahan ke bawah
     try {
       window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     } catch (_) {}
   }
 
-  // Mendeteksi tombol hijau "Start" pada landing kuis (seperti gambar 2, 3, 4)
+  // Verifikasi apakah sub-bab / halaman saat ini SUDAH 100% COMPLETE
+  function isCurrentSubTopicComplete() {
+    // 1. Cek apakah masih ada kuis yang belum dikerjakan / belum disubmit
+    const allQuizzes = extractAllQuizzes();
+    const uncompleted = allQuizzes.filter(q => !processedQuestions.has(q.fingerprint));
+    if (uncompleted.length > 0) return false;
+
+    // 2. Cek apakah ada tombol Submit/Check pada komponen kuis yang belum diklik
+    const unsubmittedBtns = queryAllDeep(".js-btn-action, button, input[type='submit']")
+      .filter(isInViewport)
+      .filter(el => !el.disabled && /^(check|submit|check answer|submit answer|periksa|kirim)$/i.test((el.innerText || el.value || "").trim()));
+    if (unsubmittedBtns.length > 0) return false;
+
+    // 3. Cek indikator teks progress di sidebar / drawer (misal "5 / 6" -> belum 100%)
+    const activeSubItems = queryAllDeep(".outline-item.is-active, .drawer-item.is-active, [class*='subtopic'].is-active, [class*='current']");
+    for (const item of activeSubItems) {
+      const text = item.innerText || "";
+      const fracMatch = text.match(/(\d+)\s*\/\s*(\d+)/);
+      if (fracMatch) {
+        const cur = parseInt(fracMatch[1], 10);
+        const tot = parseInt(fracMatch[2], 10);
+        if (cur < tot) return false; // Misal 5 / 6 -> JANGAN NEXT!
+      }
+      // Cek apakah ada ikon belum centang
+      if (item.querySelector(".icon-incomplete, [class*='incomplete'], .is-incomplete")) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // Deteksi tombol Start hijau
   async function handleQuizStartPage() {
     const candidates = queryAllDeep("button, a, [role='button'], input[type='button'], div.btn");
     for (const el of candidates) {
       if (!isInViewport(el)) continue;
       const text = (el.innerText || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
-      // Prioritaskan tombol "Start" hijau persis di bawah instruksi kuis
       if (text === "start" || /^(start|mulai|take the quiz|take quiz|start assessment|attempt quiz now)$/i.test(text)) {
         await reportStatus("Found Quiz Start button. Starting quiz...");
         simulateClick(el);
@@ -147,7 +177,7 @@
     return false;
   }
 
-  // Menangani konfirmasi modal dialog "Submit Quiz"
+  // Menangani konfirmasi modal dialog
   async function handleQuizConfirmationModal() {
     const dialogSubmitBtn = queryAllDeep(".ui-dialog button, .modal button, [role='dialog'] button")
       .filter(isInViewport)
@@ -165,33 +195,26 @@
   async function runFlow(automatic) {
     if (processing) return { ok: false, reason: "Already processing." };
 
-    // 0. Cek apakah ada modal dialog konfirmasi
     if (await handleQuizConfirmationModal()) {
       return { ok: true, modalHandled: true };
     }
 
-    // 1. Cek tombol hijau "Start" kuis (Check Your Understanding / Module Quiz)
     if (await handleQuizStartPage()) {
       return { ok: true, startedQuiz: true };
     }
 
-    // 2. Berinteraksi dengan elemen materi (tanpa menyentuh tab Resources)
     await completePageInteractives();
 
-    // 3. Ekstraksi semua kuis yang ada di halaman
     const quizes = extractAllQuizzes();
 
     if (quizes.length === 0) {
-      // Halaman bacaan biasa / non-kuis
       handleReadingPage(automatic);
       return { ok: true, skipped: true };
     }
 
-    // Periksa apakah masih ada soal yang belum terjawab
     const uncompleted = quizes.filter(q => !processedQuestions.has(q.fingerprint));
 
     if (uncompleted.length === 0) {
-      // Semua soal di halaman/kuis ini sudah terjawab
       const submitQuizBtn = findSubmitQuizButton();
       if (submitQuizBtn) {
         await reportStatus("Submitting whole quiz/assessment...");
@@ -201,9 +224,17 @@
         return { ok: true, submittedQuiz: true };
       }
 
-      await reportStatus("All quizzes on this page answered. Advancing to next sub-topic...");
+      // Pastikan sudah 100% sebelum klik Next!
+      if (!isCurrentSubTopicComplete()) {
+        await reportStatus("Sub-topic not 100% yet. Retrying interactives & unsubmitted answers...");
+        await completePageInteractives();
+        scheduleAutoRun(2000);
+        return { ok: true, waiting100: true };
+      }
+
+      await reportStatus("All items 100% completed. Moving to next sub-topic...");
       if (automatic && autoEnabled) {
-        await delay(1200);
+        await delay(1500);
         triggerNextStep();
       }
       return { ok: true, completed: true };
@@ -218,7 +249,6 @@
         let selectedIndices = [];
         let source = "";
 
-        // 1. Cek Kunci Jawaban Internal Adapt (100% Verified)
         if (quiz.id && courseData[quiz.id] && Array.isArray(courseData[quiz.id].selected_indices)) {
           selectedIndices = courseData[quiz.id].selected_indices;
           source = "Internal Adapt Data (100% Accurate)";
@@ -237,7 +267,6 @@
           }
         }
 
-        // 2. Fallback: AI Tutor
         if (!selectedIndices || selectedIndices.length === 0) {
           await reportStatus("Analyzing with AI tutor...");
           const aiResult = await chrome.runtime.sendMessage({
@@ -266,7 +295,6 @@
         }
       }
 
-      // Submit kuis jika tombol Submit Quiz ada
       const submitQuizBtn = findSubmitQuizButton();
       if (submitQuizBtn) {
         await delay(1200);
@@ -276,11 +304,19 @@
         await handleQuizConfirmationModal();
       }
 
-      // Lanjut otomatis
       if (automatic && autoEnabled) {
         await completePageInteractives();
-        await delay(1200);
-        triggerNextStep();
+        await delay(1000);
+
+        // KUNCI: Cek apakah sudah 100% selesai sebelum memicu Next!
+        if (isCurrentSubTopicComplete()) {
+          await reportStatus("Sub-topic 100% complete! Advancing to next sub-topic...");
+          await delay(1200);
+          triggerNextStep();
+        } else {
+          await reportStatus("Waiting for 100% completion in current sub-topic...");
+          scheduleAutoRun(2500);
+        }
       }
 
       return { ok: true };
@@ -302,18 +338,22 @@
     pageProgressTimer = window.setTimeout(async () => {
       if (autoEnabled && !processing && extractAllQuizzes().length === 0) {
         await completePageInteractives();
-        await reportStatus("Reading page 100% completed. Moving to next sub-topic...");
-        triggerNextStep();
+        // Cek apakah halaman bacaan ini sudah beres sebelum next
+        if (isCurrentSubTopicComplete()) {
+          await reportStatus("Reading page 100% completed. Moving to next sub-topic...");
+          triggerNextStep();
+        } else {
+          await reportStatus("Completing remaining components to reach 100%...");
+          scheduleAutoRun(2000);
+        }
       }
     }, 4000);
   }
 
-  // Ekstraksi SEMUA kuis di halaman
   function extractAllQuizzes() {
     const list = [];
     const seenRoots = new Set();
 
-    // 1. Adapt components
     const adaptRoots = queryAllDeep("[data-adapt-id], .component-mcq, .component-gmcq, .mcq, .gmcq");
     for (const root of adaptRoots) {
       if (!isInViewport(root) || seenRoots.has(root)) continue;
@@ -327,7 +367,6 @@
       }
     }
 
-    // 2. NetAcad Assessment / Quiz Questions
     const containers = queryAllDeep(
       ".question, .quiz_question, .display_question, [data-question], fieldset, [role='radiogroup'], [role='group']"
     );

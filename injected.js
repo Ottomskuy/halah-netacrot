@@ -4,7 +4,41 @@
   const sentFingerprints = new Map();
   window.__COURSE_DATA__ = data;
 
-  // Dispatch completion directly to Adapt models if available
+  // 1. Trik Sakti dari scrape.js: Deteksi components.json via Performance API & Fetch Seluruh Struktur JSON
+  async function autoDiscoverAndFetchAllCourseData() {
+    try {
+      const resources = performance.getEntriesByType("resource");
+      const compRes = resources.find((r) => r.name.includes("components.json"));
+      if (!compRes) return;
+
+      const [rawUrl, queryString] = compRes.name.split("?");
+      const baseUrl = rawUrl.replace(/components\.json$/, "");
+      const suffix = queryString ? `?${queryString}` : "";
+
+      const files = [
+        "course.json",
+        "contentObjects.json",
+        "articles.json",
+        "blocks.json",
+        "components.json"
+      ];
+
+      for (const file of files) {
+        try {
+          const res = await fetch(baseUrl + file + suffix, { credentials: "include" });
+          if (res.ok) {
+            const json = await res.json();
+            collect(json);
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  autoDiscoverAndFetchAllCourseData();
+  setInterval(autoDiscoverAndFetchAllCourseData, 5000);
+
+  // 2. Mark Adapt Models Complete & Cek Progress Adapt
   function markAllAdaptComponentsComplete() {
     try {
       if (window.Adapt) {
@@ -27,6 +61,25 @@
     } catch (_) {}
   }
 
+  // Kirim status apakah adapt saat ini sudah complete 100%
+  function reportAdaptProgress() {
+    try {
+      let is100 = true;
+      if (window.Adapt && window.Adapt.components && window.Adapt.components.models) {
+        for (const model of window.Adapt.components.models) {
+          if (model.get && model.get("_isAvailable") !== false) {
+            if (!model.get("_isComplete")) {
+              is100 = false;
+              break;
+            }
+          }
+        }
+      }
+      window.postMessage({ marker: "NETACAD_PROGRESS_STATUS", is100 }, "*");
+    } catch (_) {}
+  }
+
+  // 3. Parser Kunci Jawaban
   function collect(value) {
     if (!value) return;
     const updates = Object.create(null);
@@ -38,13 +91,12 @@
 
       const id = firstString(node._id, node._componentId, node.id, inheritedId);
       
-      // Adapt MCQ/GMCQ items inspection
       if (Array.isArray(node._items)) {
         const selected = [];
         const texts = [];
         node._items.forEach((item, index) => {
           if (!item || typeof item !== "object") return;
-          if (item._isCorrect === true || item.isCorrect === true) {
+          if (item._isCorrect === true || item.isCorrect === true || item._shouldBeSelected === true) {
             selected.push(index);
           }
           texts.push(firstString(item.title, item._title, item.text, item._text, item._label, ""));
@@ -61,14 +113,13 @@
         }
       }
 
-      // Check for questions directly structured in modern Cisco / SkillsForAll assessment objects
       if (Array.isArray(node.questions) || Array.isArray(node.answers) || Array.isArray(node.options)) {
         const optionsList = node.options || node.answers || [];
         const selected = [];
         const texts = [];
         optionsList.forEach((opt, idx) => {
           if (!opt || typeof opt !== "object") return;
-          if (opt.isCorrect === true || opt._isCorrect === true || opt.correct === true) {
+          if (opt.isCorrect === true || opt._isCorrect === true || opt.correct === true || opt._shouldBeSelected === true) {
             selected.push(idx);
           }
           texts.push(firstString(opt.text, opt.label, opt.title, ""));
@@ -105,7 +156,6 @@
     } catch (_) {}
   }
 
-  // Intercept fetch responses (components.json, course.json, assessment.json)
   const originalFetch = window.fetch;
   if (typeof originalFetch === "function" && !originalFetch.__adaptHooked) {
     const hookedFetch = function (...args) {
@@ -125,7 +175,6 @@
     window.fetch = hookedFetch;
   }
 
-  // Intercept XMLHttpRequest
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSend = XMLHttpRequest.prototype.send;
   if (!XMLHttpRequest.prototype.__adaptHooked) {
@@ -153,7 +202,6 @@
     XMLHttpRequest.prototype.__adaptHooked = true;
   }
 
-  // Poll Adapt instance & auto-complete helper
   setInterval(() => {
     if (window.Adapt) {
       if (window.Adapt.components) {
@@ -166,12 +214,14 @@
         } catch (_) {}
       }
       markAllAdaptComponentsComplete();
+      reportAdaptProgress();
     }
   }, 2500);
 
   window.addEventListener("message", (event) => {
     if (event.data && event.data.type === "FORCE_ADAPT_COMPLETE") {
       markAllAdaptComponentsComplete();
+      reportAdaptProgress();
     }
   });
 })();
