@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Learning Assistant Options</title>
+    <style>
+      body { max-width: 640px; margin: 32px auto; padding: 0 20px; font: 15px/1.5 system-ui, sans-serif; color: #172033; }
+      label { display: block; margin-top: 18px; font-weight: 600; }
+      input, select { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 9px; font: inherit; }
+      button { margin-top: 20px; padding: 9px 16px; cursor: pointer; }
+      .note { padding: 12px; background: #f1f5fb; border-radius: 6px; }
+      #status { min-height: 24px; }
+    </style>
+  </head>
+  <body>
+    <h1>Provider settings</h1>
+    <p class="note">
+      Free quotas and availability can change; no provider can be guaranteed permanently free.
+      Check the provider's current terms. Your key is stored locally in this browser profile.
+    </p>
+    <form id="settingsForm">
+      <label for="provider">Provider</label>
+      <select id="provider">
+        <option value="groq">Groq (OpenAI-compatible)</option>
+        <option value="openrouter">OpenRouter (select a :free model)</option>
+        <option value="gemini">Google AI Studio (Gemini API)</option>
+      </select>
+
+      <label for="baseUrl">Base URL (OpenAI-compatible providers)</label>
+      <input id="baseUrl" type="url" autocomplete="url" spellcheck="false">
+
+      <label for="model">Model name</label>
+      <input id="model" type="text" required spellcheck="false">
+
+      <label for="apiKey">API key</label>
+      <input id="apiKey" type="password" autocomplete="new-password">
+
+      <button type="submit">Save settings</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </form>
+    <script src="options.js"></script>
+  </body>
+</html>

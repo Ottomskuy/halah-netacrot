@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Adapt Auto-Complete & Auto-Next",
+  "version": "1.0.0",
+  "description": "Client-side course component monitor and optional sequential navigation helper.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["*://*.netacad.com/*"],
+  "action": {
+    "default_title": "Adapt Auto-Complete & Auto-Next",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.netacad.com/*"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["*://*.netacad.com/*"]
+    }
+  ]
+}

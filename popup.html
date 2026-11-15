@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Interactive Learning Assistant</title>
+    <style>
+      body { width: 300px; margin: 0; padding: 16px; font: 14px/1.45 system-ui, sans-serif; color: #172033; }
+      h1 { margin: 0 0 12px; font-size: 17px; }
+      .toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      button { width: 100%; margin-top: 12px; padding: 9px; cursor: pointer; }
+      #status { min-height: 36px; margin: 12px 0 0; color: #45516a; overflow-wrap: anywhere; }
+      a { color: #155eef; }
+    </style>
+  </head>
+  <body>
+    <h1>Interactive Learning Assistant</h1>
+    <label class="toggle" for="autoEnabled">
+      <span>Auto-Interactive Flow</span>
+      <input id="autoEnabled" type="checkbox">
+    </label>
+    <button id="analyzeNow" type="button">Analyze current question</button>
+    <p id="status" role="status" aria-live="polite">Ready.</p>
+    <a href="#" id="openOptions">Provider and API key settings</a>
+    <script src="popup.js"></script>
+  </body>
+</html>

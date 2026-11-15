@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Adapt Auto-Next</title>
+    <style>
+      body { width: 280px; margin: 0; padding: 16px; font: 14px/1.45 system-ui, sans-serif; color: #172033; }
+      h1 { margin: 0 0 14px; font-size: 17px; }
+      label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      #count { font-weight: 700; }
+      #status { min-height: 36px; margin: 12px 0 0; color: #45516a; overflow-wrap: anywhere; }
+      .note { margin-bottom: 0; color: #667085; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>Adapt Auto-Next</h1>
+    <label for="autoEnabled">
+      <span>Auto-Complete &amp; Auto-Next</span>
+      <input id="autoEnabled" type="checkbox">
+    </label>
+    <p>Quiz components detected: <span id="count">0</span></p>
+    <p id="status" role="status" aria-live="polite">Ready.</p>
+    <p class="note">Client-side only. No API key or external service is used.</p>
+    <script src="popup.js"></script>
+  </body>
+</html>

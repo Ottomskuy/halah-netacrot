@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Interactive Learning Assistant",
+  "version": "1.0.0",
+  "description": "Analyze visible course questions and optionally select answers and advance the page.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://api.groq.com/*",
+    "https://openrouter.ai/*",
+    "https://generativelanguage.googleapis.com/*",
+    "*://*.netacad.com/*"
+  ],
+  "optional_host_permissions": ["https://*/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.netacad.com/*"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Interactive Learning Assistant",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html"
+}
