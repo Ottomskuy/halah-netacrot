@@ -1,29 +1,45 @@
 {
   "manifest_version": 3,
-  "name": "Interactive Learning Assistant",
-  "version": "1.0.0",
-  "description": "Analyze visible course questions and optionally select answers and advance the page.",
+  "name": "NetAcad Auto Master & Next",
+  "version": "2.0.0",
+  "description": "Auto-answer correct questions (Adapt Framework inspection & AI Fallback) and auto-advance across modules and sub-topics.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
     "https://generativelanguage.googleapis.com/*",
-    "*://*.netacad.com/*"
+    "*://*.netacad.com/*",
+    "*://*.skillsforall.com/*",
+    "*://*.cisco.com/*"
   ],
   "optional_host_permissions": ["https://*/*"],
   "content_scripts": [
     {
-      "matches": ["*://*.netacad.com/*"],
+      "matches": [
+        "*://*.netacad.com/*",
+        "*://*.skillsforall.com/*",
+        "*://*.cisco.com/*"
+      ],
       "js": ["content.js"],
       "all_frames": true,
       "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": [
+        "*://*.netacad.com/*",
+        "*://*.skillsforall.com/*",
+        "*://*.cisco.com/*"
+      ]
     }
   ],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Interactive Learning Assistant",
+    "default_title": "NetAcad Auto Master",
     "default_popup": "popup.html"
   },
   "options_page": "options.html"

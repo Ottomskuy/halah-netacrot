@@ -8,12 +8,15 @@ const DEFAULTS = {
 };
 
 const SYSTEM_PROMPT = [
-  "You are a networking-course tutor. Analyze the provided question and answer options.",
-  "Choose every option that is correct. Use zero-based indices from the supplied options array.",
+  "You are a networking tutor. The supplied question text and options are the complete task context.",
+  "Use general networking knowledge to answer; do not abstain merely because this is a course question.",
+  "Choose the best-supported option(s), matching the option wording to the question.",
+  "Use zero-based indices from the supplied options array.",
   "Return only a JSON object with this exact shape:",
   '{"selected_indices":[0],"explanation":"A brief explanation."}',
   "For a single-choice question return one index; for a multiple-choice question return all applicable indices.",
-  "If the question cannot be answered from the available information, return an empty selected_indices array and explain why."
+  "Do not return an empty selected_indices array when the question and options are present; make the best-supported choice.",
+  "Example: the statement 'DTP is an open standard IEEE protocol' is false because DTP is Cisco-proprietary, not an IEEE standard."
 ].join(" ");
 
 chrome.runtime.onInstalled.addListener(() => {

@@ -2,20 +2,50 @@
   if (window.__interactiveLearningAssistantLoaded) return;
   window.__interactiveLearningAssistantLoaded = true;
 
+  const MESSAGE_MARKER = "NETACAD_ADAPT_DATA";
+  const courseData = Object.create(null);
+  const processedQuestions = new Set();
+  
   let autoEnabled = false;
   let processing = false;
-  let lastAnsweredFingerprint = "";
   let observerTimer = 0;
+  let pageProgressTimer = 0;
 
+  // 1. Initial State & Storage Sync
   chrome.storage.local.get(["autoEnabled"]).then((settings) => {
     autoEnabled = Boolean(settings.autoEnabled);
-    if (autoEnabled) scheduleAutomaticRun();
+    if (autoEnabled) scheduleAutoRun(800);
   });
 
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === "local" && changes.autoEnabled) {
+      autoEnabled = Boolean(changes.autoEnabled.newValue);
+      if (autoEnabled) scheduleAutoRun(400);
+    }
+  });
+
+  // 2. Main-World Hook Injection (for 100% accurate Adapt data & completion)
+  injectMainWorldHook();
+
+  // Listen for internal course data passed by injected.js
+  window.addEventListener("message", (event) => {
+    if (event.source !== window || !event.data) return;
+    
+    if (event.data.marker === MESSAGE_MARKER && event.data.updates) {
+      Object.assign(courseData, event.data.updates);
+      if (autoEnabled && !processing) scheduleAutoRun(400);
+    }
+
+    if (event.data.type === "NETACAD_TRIGGER_NEXT") {
+      triggerNextStep();
+    }
+  });
+
+  // 3. Runtime Message Listener
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "SET_AUTO_MODE") {
       autoEnabled = Boolean(message.enabled);
-      if (autoEnabled) scheduleAutomaticRun();
+      if (autoEnabled) scheduleAutoRun(400);
       sendResponse({ ok: true });
       return false;
     }
@@ -26,8 +56,9 @@
     return false;
   });
 
+  // 4. DOM Observer to react to dynamically loaded SPA steps
   const observer = new MutationObserver(() => {
-    if (autoEnabled) scheduleAutomaticRun();
+    if (autoEnabled) scheduleAutoRun(1000);
   });
   observer.observe(document.documentElement, {
     childList: true,
@@ -35,373 +66,526 @@
     characterData: true
   });
 
-  function scheduleAutomaticRun() {
+  function scheduleAutoRun(delayMs = 800) {
     window.clearTimeout(observerTimer);
     observerTimer = window.setTimeout(() => {
       if (autoEnabled && !processing) runFlow(true);
-    }, 700);
+    }, delayMs);
   }
 
-  async function runFlow(automatic) {
-    if (processing) return { ok: false, reason: "A question is already being processed." };
-    const questionData = extractQuestion();
-    if (!questionData) {
-      const frameInfo = {
-        frameUrl: location.href,
-        radioCount: queryAllDeep('input[type="radio"], input[type="checkbox"]').length,
-        customCount: queryAllDeep(
-          '[role="radio"], [role="checkbox"], [aria-checked], [class*="option"], [class*="choice"], [class*="answer"], [class*="item"]'
-        ).filter(isInViewport).length,
-        textSample: (document.body && document.body.innerText || "").trim().slice(0, 180)
-      };
-      if (window !== window.top) {
-        return { ok: true, skipped: true, frameInfo };
-      }
-      if (hasNetAcadFrame()) {
-        await reportStatus("Waiting for the course question inside its NetAcad frame.");
-        return { ok: true, skipped: true, frameInfo };
-      }
-      await reportStatus("No active question with visible answer options was found.");
-      return { ok: false, reason: "No active question found.", frameInfo };
-    }
+  function injectMainWorldHook() {
+    const appendScript = () => {
+      const parent = document.documentElement || document.head;
+      if (!parent || document.querySelector("script[data-netacad-adapt-hook]")) return false;
 
-    const fingerprint = `${questionData.question}|${questionData.options.map((item) => item.text).join("|")}`;
-    if (automatic && fingerprint === lastAnsweredFingerprint) {
-      await advanceAfterFeedback();
-      return { ok: true, skipped: true };
-    }
+      const script = document.createElement("script");
+      script.src = chrome.runtime.getURL("injected.js");
+      script.dataset.netacadAdaptHook = "true";
+      script.onload = () => script.remove();
+      script.onerror = () => script.remove();
+      parent.appendChild(script);
+      return true;
+    };
 
-    processing = true;
-    try {
-      await reportStatus("Analyzing the visible question...");
-      const result = await chrome.runtime.sendMessage({
-        type: "ANALYZE_QUESTION",
-        question: questionData.question,
-        options: questionData.options.map(({ index, text }) => ({ index, text }))
-      });
-      if (!result || result.error) throw new Error(result && result.error || "Analysis failed.");
-
-      if (result.selected_indices.length === 0) {
-        await reportStatus(`No selection made. ${result.explanation}`);
-        return { ok: true, result };
-      }
-
-      const selection = await selectOptions(questionData.options, result.selected_indices);
-      if (selection.verified.length !== result.selected_indices.length) {
-        const optionSummary = questionData.options.map((option, index) =>
-          `${index}: ${option.text}`
-        ).join(" | ");
-        const message = `Click was not confirmed. Question: ${questionData.question.slice(0, 180)} | Options: ${optionSummary.slice(0, 220)}`;
-        await reportStatus(message);
-        return { ok: false, error: message };
-      }
-
-      lastAnsweredFingerprint = fingerprint;
-      await reportStatus(`Selected ${selection.verified.length} option(s). ${result.explanation}`);
-
-      if (automatic && autoEnabled) await submitAndAdvance();
-      return { ok: true, result, selection };
-    } catch (error) {
-      await reportStatus(`Could not complete the flow: ${error.message}`);
-      return { ok: false, error: error.message };
-    } finally {
-      processing = false;
-    }
-  }
-
-  function extractQuestion() {
-    // Adjust these group selectors if the target LMS uses custom question containers.
-    const inputs = queryAllDeep('input[type="radio"], input[type="checkbox"]')
-      .filter((input) => {
-        const label = getOptionLabel(input);
-        return !input.disabled && label && isInViewport(label);
-      });
-    if (!inputs.length) return extractCustomQuestion();
-
-    const first = inputs[0];
-    const group = first.closest('fieldset, [role="radiogroup"], [role="group"], [data-question]')
-      || findSmallestOptionContainer(first, inputs);
-    const groupedInputs = inputs.filter((input) => group.contains(input));
-    if (!groupedInputs.length) return null;
-
-    const options = groupedInputs.map((input, index) => {
-      const label = getOptionLabel(input);
-      return { index, text: (label.innerText || "").trim(), input, label };
-    }).filter((option) => option.text);
-    if (!options.length) return null;
-
-    const question = getQuestionText(group, options);
-    if (!question) return null;
-    return { question, options };
-  }
-
-  function extractCustomQuestion() {
-    // Adapt themes may render choices as clickable divs instead of native inputs.
-    const groupSelector = [
-      "fieldset",
-      '[role="radiogroup"]',
-      '[role="group"]',
-      "[data-question]",
-      "[data-adapt-id]",
-      ".component-mcq",
-      ".component-gmcq",
-      ".mcq",
-      ".gmcq",
-      '[class*="mcq"]',
-      '[class*="gmcq"]'
-    ].join(",");
-    const optionSelector = [
-      ".component-item",
-      ".mcq-item",
-      ".gmcq-item",
-      '[role="radio"]',
-      '[role="checkbox"]',
-      "[aria-checked]",
-      '[tabindex]:not([tabindex="-1"])',
-      '[class*="option"]',
-      '[class*="choice"]',
-      '[class*="answer"]',
-      '[class*="item"]',
-      "label"
-    ].join(",");
-
-    const groups = [...queryAllDeep(groupSelector), document.body].filter(Boolean);
-    for (const group of groups) {
-      if (!isInViewport(group)) continue;
-      const candidates = queryAllDeep(optionSelector, group)
-        .filter((element) => isInViewport(element) && (element.innerText || "").trim())
-        .filter((element) => !queryAllDeep(optionSelector, element)
-          .some((child) => (child.innerText || "").trim()));
-      const options = candidates.map((element, index) => ({
-        index,
-        text: (element.innerText || "").trim(),
-        input: null,
-        label: element
-      }));
-      if (options.length < 2) continue;
-
-      const question = getQuestionText(group, options);
-      if (question) return { question, options };
-    }
-    return null;
-  }
-
-  function getOptionLabel(input) {
-    if (input.labels && input.labels.length) return input.labels[0];
-    // Customize label selectors here for LMS markup that does not use a <label for="...">.
-    return input.closest("label") || input.parentElement ||
-      (input.getRootNode().host && input.getRootNode().host);
-  }
-
-  function queryAllDeep(selector, root) {
-    const scope = root || document;
-    const results = [...scope.querySelectorAll(selector)];
-    for (const element of scope.querySelectorAll("*")) {
-      if (element.shadowRoot) results.push(...queryAllDeep(selector, element.shadowRoot));
-    }
-    return [...new Set(results)];
-  }
-
-  function findSmallestOptionContainer(input, visibleInputs) {
-    let node = input.parentElement;
-    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
-      const count = visibleInputs.filter((candidate) => node.contains(candidate)).length;
-      if (count > 1) return node;
-    }
-    return input.form || document.body;
-  }
-
-  function getQuestionText(group, options) {
-    // Prefer dedicated prompt elements; headings like "Question 1" are not the question.
-    const prompt = group.querySelector(
-      "legend, [data-question-text], .question-text, .mcq-question, .gmcq-question"
-    );
-    if (prompt && prompt.innerText.trim()) return prompt.innerText.trim();
-
-    const optionTexts = options.map((option) => normalizeText(option.text));
-    const ancestors = [];
-    let node = group;
-    for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
-      ancestors.push(node);
-    }
-    const promptCandidates = ancestors.flatMap((ancestor) => [
-      ...ancestor.querySelectorAll(
-        "p, [data-question-text], [class*='question'], [class*='prompt'], [class*='stem']"
-      )
-    ]).map((element) => (element.innerText || "").trim())
-      .filter((text) => text.length >= 20 && text.length <= 500)
-      .filter((text) => !/^question\s*\d*$/i.test(text))
-      .filter((text) => !optionTexts.includes(normalizeText(text)))
-      .filter((text) => text.includes("?") || /\b(true or false|select|which|what|where|why)\b/i.test(text));
-    if (promptCandidates.length) {
-      return promptCandidates.sort((a, b) => a.length - b.length)[0];
-    }
-
-    const lines = (group.innerText || "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    const remaining = lines.filter((line) =>
-      !/^question\s*\d*$/i.test(line) &&
-      !optionTexts.includes(normalizeText(line))
-    );
-    return remaining.join("\n").trim().slice(0, 4000);
-  }
-
-  function normalizeText(text) {
-    return text.replace(/\s+/g, " ").trim().toLowerCase();
-  }
-
-  function isInViewport(element) {
-    const rect = element.getBoundingClientRect();
-    const style = window.getComputedStyle(element);
-    const visible = rect.width > 0 && rect.height > 0 &&
-      style.display !== "none" && style.visibility !== "hidden" &&
-      Number(style.opacity) !== 0;
-    return visible && rect.bottom > 0 && rect.top < window.innerHeight &&
-      rect.right > 0 && rect.left < window.innerWidth;
-  }
-
-  function hasNetAcadFrame() {
-    return [...document.querySelectorAll("iframe")].some((frame) => {
-      try {
-        const host = new URL(frame.src, location.href).hostname;
-        return host === "netacad.com" || host.endsWith(".netacad.com");
-      } catch (error) {
-        return false;
-      }
+    if (appendScript()) return;
+    const retryObserver = new MutationObserver(() => {
+      if (appendScript()) retryObserver.disconnect();
     });
+    retryObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
-  async function selectOptions(options, selectedIndices) {
-    const verified = [];
-    for (const index of selectedIndices) {
-      const option = options[index];
-      if (!option) continue;
-      const input = option.input || option.label.querySelector(
-        'input[type="radio"], input[type="checkbox"]'
-      );
-      if (input) {
-        input.click();
-      } else {
-        // Prefer the Adapt item/card ancestor, whose delegated handler owns the choice.
-        const target = option.label.closest(
-          'label, button, [role="radio"], [role="checkbox"], [aria-checked], [tabindex], .component-item, .mcq-item, .gmcq-item'
-        ) || option.label;
-        target.dispatchEvent(new MouseEvent("mousedown", {
-          bubbles: true,
-          cancelable: true,
-          view: window
-        }));
-        target.dispatchEvent(new MouseEvent("mouseup", {
-          bubbles: true,
-          cancelable: true,
-          view: window
-        }));
-        target.click();
+  // Menangani interaksi halaman konten (Tab konten, Accordion)
+  // DIKECUALIKAN: Tab "Resources", "Course Outline", Navigasi Sidebar global agar tidak nyasar keluar
+  async function completePageInteractives() {
+    const interactives = queryAllDeep([
+      ".accordion-item__title",
+      ".narrative__nav-btn--next",
+      ".hotgraphic-pin",
+      ".media-btn",
+      ".reveal-btn",
+      ".narrative-slider-nav-btn",
+      // Hanya tab materi di dalam kontainer konten / article
+      "article [role='tab']",
+      ".component-tab [role='tab']",
+      ".tabs__tab-title"
+    ].join(","));
+
+    for (const el of interactives) {
+      const text = (el.innerText || el.getAttribute("aria-label") || "").trim().toLowerCase();
+      // JANGAN KLIK TAB RESOURCE / OUTLINE / HEADER SIDEBAR!
+      if (/resource|outline|menu|search|daftar isi/i.test(text)) continue;
+
+      if (isInViewport(el) && !el.classList.contains("visited") && !el.classList.contains("is-visited")) {
+        simulateClick(el);
+        await delay(250);
       }
-
-      await delay(180);
-      if (isOptionSelected(option)) verified.push(index);
     }
-    return { verified };
+
+    // Trigger Adapt internal complete event
+    window.postMessage({ type: "FORCE_ADAPT_COMPLETE" }, "*");
+
+    // Scroll perlahan ke bawah
+    try {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    } catch (_) {}
   }
 
-  function isOptionSelected(option) {
-    const input = option.input || option.label.querySelector(
-      'input[type="radio"], input[type="checkbox"]'
-    );
-    if (input && input.checked) return true;
-
-    let element = option.label;
-    for (let depth = 0; element && depth < 5; depth += 1, element = element.parentElement) {
-      if (element.getAttribute("aria-checked") === "true" ||
-          element.getAttribute("aria-selected") === "true" ||
-          element.getAttribute("aria-pressed") === "true") return true;
-      if (/\b(selected|checked|active|is-selected|is-checked)\b/i.test(element.className || "")) {
+  // Mendeteksi tombol hijau "Start" pada landing kuis (seperti gambar 2, 3, 4)
+  async function handleQuizStartPage() {
+    const candidates = queryAllDeep("button, a, [role='button'], input[type='button'], div.btn");
+    for (const el of candidates) {
+      if (!isInViewport(el)) continue;
+      const text = (el.innerText || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
+      // Prioritaskan tombol "Start" hijau persis di bawah instruksi kuis
+      if (text === "start" || /^(start|mulai|take the quiz|take quiz|start assessment|attempt quiz now)$/i.test(text)) {
+        await reportStatus("Found Quiz Start button. Starting quiz...");
+        simulateClick(el);
+        await delay(2000);
         return true;
       }
     }
     return false;
   }
 
-  async function submitAndAdvance() {
-    await delay(randomDelay());
-    if (!autoEnabled) return;
+  // Menangani konfirmasi modal dialog "Submit Quiz"
+  async function handleQuizConfirmationModal() {
+    const dialogSubmitBtn = queryAllDeep(".ui-dialog button, .modal button, [role='dialog'] button")
+      .filter(isInViewport)
+      .find(el => /submit|confirm|ok|yes|ya|lanjutkan/i.test((el.innerText || "").trim()));
 
-    const checkButton = findActionButton(["check", "submit", "submit answer"]);
-    if (checkButton) {
-      checkButton.click();
-      await waitForDomChange(8000);
-      if (!autoEnabled) return;
-      await delay(randomDelay());
+    if (dialogSubmitBtn) {
+      simulateClick(dialogSubmitBtn);
+      await delay(1000);
+      return true;
     }
-
-    const nextButton = findActionButton(["next", "continue", "next question", "next lesson"]);
-    if (nextButton && autoEnabled) {
-      nextButton.click();
-      await reportStatus("Advanced to the next step.");
-      await delay(500);
-      scheduleAutomaticRun();
-    } else if (!checkButton) {
-      await reportStatus("Answer selected; no Check, Submit, or Next button was found.");
-    }
+    return false;
   }
 
-  async function advanceAfterFeedback() {
-    if (!autoEnabled || processing) return;
-    const nextButton = findActionButton(["next", "continue", "next question", "next lesson"]);
-    if (!nextButton) return;
+  // Main Pipeline
+  async function runFlow(automatic) {
+    if (processing) return { ok: false, reason: "Already processing." };
+
+    // 0. Cek apakah ada modal dialog konfirmasi
+    if (await handleQuizConfirmationModal()) {
+      return { ok: true, modalHandled: true };
+    }
+
+    // 1. Cek tombol hijau "Start" kuis (Check Your Understanding / Module Quiz)
+    if (await handleQuizStartPage()) {
+      return { ok: true, startedQuiz: true };
+    }
+
+    // 2. Berinteraksi dengan elemen materi (tanpa menyentuh tab Resources)
+    await completePageInteractives();
+
+    // 3. Ekstraksi semua kuis yang ada di halaman
+    const quizes = extractAllQuizzes();
+
+    if (quizes.length === 0) {
+      // Halaman bacaan biasa / non-kuis
+      handleReadingPage(automatic);
+      return { ok: true, skipped: true };
+    }
+
+    // Periksa apakah masih ada soal yang belum terjawab
+    const uncompleted = quizes.filter(q => !processedQuestions.has(q.fingerprint));
+
+    if (uncompleted.length === 0) {
+      // Semua soal di halaman/kuis ini sudah terjawab
+      const submitQuizBtn = findSubmitQuizButton();
+      if (submitQuizBtn) {
+        await reportStatus("Submitting whole quiz/assessment...");
+        simulateClick(submitQuizBtn);
+        await delay(1500);
+        await handleQuizConfirmationModal();
+        return { ok: true, submittedQuiz: true };
+      }
+
+      await reportStatus("All quizzes on this page answered. Advancing to next sub-topic...");
+      if (automatic && autoEnabled) {
+        await delay(1200);
+        triggerNextStep();
+      }
+      return { ok: true, completed: true };
+    }
+
     processing = true;
     try {
-      await delay(randomDelay());
-      if (autoEnabled && nextButton.isConnected) {
-        nextButton.click();
-        await reportStatus("Advanced to the next step.");
+      for (const quiz of uncompleted) {
+        if (!autoEnabled) break;
+        await reportStatus(`Answering: ${quiz.question.slice(0, 50)}...`);
+
+        let selectedIndices = [];
+        let source = "";
+
+        // 1. Cek Kunci Jawaban Internal Adapt (100% Verified)
+        if (quiz.id && courseData[quiz.id] && Array.isArray(courseData[quiz.id].selected_indices)) {
+          selectedIndices = courseData[quiz.id].selected_indices;
+          source = "Internal Adapt Data (100% Accurate)";
+        } else {
+          for (const [adaptId, comp] of Object.entries(courseData)) {
+            if (comp.option_texts && comp.option_texts.length === quiz.options.length) {
+              const match = comp.option_texts.every((t, i) => 
+                normalizeText(t) === normalizeText(quiz.options[i].text)
+              );
+              if (match && comp.selected_indices) {
+                selectedIndices = comp.selected_indices;
+                source = "Internal Adapt Match (100% Accurate)";
+                break;
+              }
+            }
+          }
+        }
+
+        // 2. Fallback: AI Tutor
+        if (!selectedIndices || selectedIndices.length === 0) {
+          await reportStatus("Analyzing with AI tutor...");
+          const aiResult = await chrome.runtime.sendMessage({
+            type: "ANALYZE_QUESTION",
+            question: quiz.question,
+            options: quiz.options.map(({ index, text }) => ({ index, text }))
+          });
+
+          if (aiResult && Array.isArray(aiResult.selected_indices) && aiResult.selected_indices.length > 0) {
+            selectedIndices = aiResult.selected_indices;
+            source = `AI Tutor (${aiResult.explanation || "Selected"})`;
+          }
+        }
+
+        if (selectedIndices && selectedIndices.length > 0) {
+          await selectOptions(quiz.options, selectedIndices);
+          processedQuestions.add(quiz.fingerprint);
+          await reportStatus(`Selected [${selectedIndices.join(",")}] via ${source}`);
+
+          await delay(600);
+          const compSubmit = findComponentSubmit(quiz.root);
+          if (compSubmit) {
+            simulateClick(compSubmit);
+            await delay(800);
+          }
+        }
       }
+
+      // Submit kuis jika tombol Submit Quiz ada
+      const submitQuizBtn = findSubmitQuizButton();
+      if (submitQuizBtn) {
+        await delay(1200);
+        await reportStatus("Submitting whole quiz/assessment...");
+        simulateClick(submitQuizBtn);
+        await delay(1500);
+        await handleQuizConfirmationModal();
+      }
+
+      // Lanjut otomatis
+      if (automatic && autoEnabled) {
+        await completePageInteractives();
+        await delay(1200);
+        triggerNextStep();
+      }
+
+      return { ok: true };
+    } catch (err) {
+      await reportStatus(`Error: ${err.message}`);
+      return { ok: false, error: err.message };
     } finally {
       processing = false;
-      scheduleAutomaticRun();
     }
   }
 
-  function findActionButton(actionWords) {
-    // Add LMS-specific CSS selectors here if action controls are not native buttons.
-    const candidates = [...document.querySelectorAll(
-      'button, input[type="button"], input[type="submit"], [role="button"], a'
-    )].filter((element) => !element.disabled && isInViewport(element));
-    const normalized = (element) =>
-      `${element.innerText || element.value || ""} ${element.getAttribute("aria-label") || ""}`
-        .trim().toLowerCase();
+  function handleReadingPage(automatic) {
+    if (!automatic || !autoEnabled || processing) return;
 
-    return candidates.find((element) =>
-      actionWords.some((word) => normalized(element) === word || normalized(element).includes(word))
-    ) || null;
+    const textLength = (document.body && document.body.innerText || "").length;
+    if (textLength < 80) return;
+
+    window.clearTimeout(pageProgressTimer);
+    pageProgressTimer = window.setTimeout(async () => {
+      if (autoEnabled && !processing && extractAllQuizzes().length === 0) {
+        await completePageInteractives();
+        await reportStatus("Reading page 100% completed. Moving to next sub-topic...");
+        triggerNextStep();
+      }
+    }, 4000);
   }
 
-  function waitForDomChange(timeout) {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        temporaryObserver.disconnect();
-        resolve();
-      };
-      const temporaryObserver = new MutationObserver(finish);
-      temporaryObserver.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        characterData: true
-      });
-      const timer = setTimeout(finish, timeout);
+  // Ekstraksi SEMUA kuis di halaman
+  function extractAllQuizzes() {
+    const list = [];
+    const seenRoots = new Set();
+
+    // 1. Adapt components
+    const adaptRoots = queryAllDeep("[data-adapt-id], .component-mcq, .component-gmcq, .mcq, .gmcq");
+    for (const root of adaptRoots) {
+      if (!isInViewport(root) || seenRoots.has(root)) continue;
+      const options = findComponentOptions(root);
+      if (options.length >= 2) {
+        seenRoots.add(root);
+        const id = root.getAttribute("data-adapt-id") || root.getAttribute("data-component-id") || root.id;
+        const question = getQuestionText(root, options) || "Adapt Question";
+        const fingerprint = `${id}|${question}|${options.map(o => o.text).join("|")}`;
+        list.push({ id, question, options, root, fingerprint });
+      }
+    }
+
+    // 2. NetAcad Assessment / Quiz Questions
+    const containers = queryAllDeep(
+      ".question, .quiz_question, .display_question, [data-question], fieldset, [role='radiogroup'], [role='group']"
+    );
+    for (const container of containers) {
+      if (!isInViewport(container) || seenRoots.has(container)) continue;
+      const options = findComponentOptions(container);
+      if (options.length >= 2 && options.length <= 12) {
+        seenRoots.add(container);
+        const id = container.getAttribute("data-question-id") || container.id || "";
+        const question = getQuestionText(container, options);
+        if (question) {
+          const fingerprint = `${id}|${question}|${options.map(o => o.text).join("|")}`;
+          list.push({ id, question, options, root: container, fingerprint });
+        }
+      }
+    }
+
+    return list;
+  }
+
+  function findComponentOptions(root) {
+    const inputs = queryAllDeep('input[type="radio"], input[type="checkbox"]', root);
+    if (inputs.length >= 2) {
+      return inputs.map((input, index) => {
+        const label = getOptionLabel(input);
+        return {
+          index,
+          input,
+          clickable: label || input,
+          text: (label && label.innerText || input.value || "").trim()
+        };
+      }).filter(o => o.text);
+    }
+
+    const items = queryAllDeep(
+      ".component-item, .mcq-item, .gmcq-item, [role='radio'], [role='checkbox'], .answer_label, [class*='choice-item']",
+      root
+    ).filter(isInViewport);
+
+    return items.map((element, index) => ({
+      index,
+      input: element.querySelector('input[type="radio"], input[type="checkbox"]'),
+      clickable: element,
+      text: (element.innerText || "").trim()
+    })).filter(o => o.text && o.text.length <= 250);
+  }
+
+  function getOptionLabel(input) {
+    if (input.labels && input.labels[0]) return input.labels[0];
+    const parentLabel = input.closest("label");
+    if (parentLabel) return parentLabel;
+    if (input.id) {
+      const forLabel = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
+      if (forLabel) return forLabel;
+    }
+    return input.closest(".component-item, .choice, li, div") || input.parentElement;
+  }
+
+  function getQuestionText(root, options) {
+    const promptElements = queryAllDeep(
+      ".component-title, .component-instruction, .question-text, .question_text, legend, h3, h4, p, [class*='prompt'], [class*='stem']",
+      root
+    );
+    const optionTexts = new Set(options.map(o => normalizeText(o.text)));
+    for (const el of promptElements) {
+      const text = (el.innerText || "").trim();
+      if (text.length > 10 && !optionTexts.has(normalizeText(text))) {
+        return text;
+      }
+    }
+    return (root.innerText || "").slice(0, 200).trim();
+  }
+
+  async function selectOptions(options, targetIndices) {
+    for (const index of targetIndices) {
+      const option = options[index];
+      if (!option || !option.clickable) continue;
+      
+      const isAlreadyChecked = (option.input && option.input.checked) ||
+        option.clickable.getAttribute("aria-checked") === "true" ||
+        option.clickable.classList.contains("selected") ||
+        option.clickable.classList.contains("is-selected");
+
+      if (!isAlreadyChecked) {
+        simulateClick(option.clickable);
+        await delay(250);
+      }
+    }
+  }
+
+  function findComponentSubmit(root) {
+    if (!root) return null;
+    const candidates = [...root.querySelectorAll(".js-btn-action, button, input[type='submit'], [role='button']")];
+    return candidates.find(el => 
+      /^(submit|check|check answer|submit answer|periksa|kirim)$/i.test(
+        (el.innerText || el.value || el.getAttribute("aria-label") || "").trim()
+      )
+    );
+  }
+
+  function findSubmitQuizButton() {
+    const candidates = queryAllDeep([
+      "button[id*='submit_quiz']",
+      "button.submit_quiz_button",
+      "input.submit_quiz_button",
+      "button[type='submit']",
+      "input[type='submit']",
+      ".btn-submit",
+      "button",
+      "a[role='button']"
+    ].join(",")).filter(isInViewport);
+
+    return candidates.find(el => {
+      const text = `${el.innerText || el.value || ""} ${el.getAttribute("aria-label") || ""}`.trim().toLowerCase();
+      return /submit quiz|submit assessment|kumpulkan kuis|akhiri kuis|finish attempt/i.test(text);
+    }) || null;
+  }
+
+  // Cross-Frame Navigation Handler
+  function triggerNextStep() {
+    const nextBtn = findGlobalNextButton();
+    if (nextBtn) {
+      reportStatus("Moving to next sub-topic...");
+      simulateClick(nextBtn);
+      scheduleAutoRun(2500);
+      return;
+    }
+
+    if (window !== window.top) {
+      window.top.postMessage({ type: "NETACAD_TRIGGER_NEXT" }, "*");
+    } else {
+      const iframes = document.querySelectorAll("iframe");
+      for (const iframe of iframes) {
+        try {
+          const doc = iframe.contentDocument || iframe.contentWindow.document;
+          const innerNext = findNextInDocument(doc);
+          if (innerNext) {
+            simulateClick(innerNext);
+            reportStatus("Triggered next inside content frame.");
+            scheduleAutoRun(2500);
+            return;
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  function findGlobalNextButton() {
+    return findNextInDocument(document);
+  }
+
+  function findNextInDocument(doc) {
+    if (!doc) return null;
+    const candidates = [
+      ...doc.querySelectorAll([
+        ".navigation-next",
+        ".nav-next",
+        ".btn-next",
+        ".next-btn",
+        ".next-button",
+        ".js-btn-action",
+        "[data-action='next']",
+        "[data-testid*='next']",
+        ".nav__btn--next",
+        ".page-nav__btn--next",
+        ".drawer__nav-btn--next",
+        "a.next_page",
+        "a[rel='next']",
+        ".module-sequence-footer-button--next a",
+        "button[aria-label*='next' i]",
+        "button[aria-label*='selanjutnya' i]",
+        "a[aria-label*='next' i]",
+        "button[title*='next' i]",
+        "a[title*='next' i]",
+        "button", "a", "[role='button']"
+      ].join(","))
+    ].filter((el) => !el.disabled && isInViewport(el));
+
+    const keywords = [
+      "next", "continue", "next page", "next module", "next topic", "next section",
+      "selanjutnya", "berikutnya", "lanjut", "next lesson", "complete & continue"
+    ];
+
+    for (const el of candidates) {
+      const text = [
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.value,
+        el.className
+      ].filter(Boolean).join(" ").trim().toLowerCase();
+
+      if (keywords.some(k => text === k || text.includes(k))) {
+        if (!/prev|back|sebelumnya/i.test(text)) {
+          return el;
+        }
+      }
+    }
+
+    const chevronNext = doc.querySelector(
+      "[class*='next'] svg, [class*='chevron-right'], [class*='arrow-right'], .fa-chevron-right, .fa-arrow-right"
+    );
+    if (chevronNext) {
+      const btn = chevronNext.closest("button, a, [role='button']");
+      if (btn && !btn.disabled && isInViewport(btn)) return btn;
+    }
+
+    return null;
+  }
+
+  function simulateClick(element) {
+    if (!element) return;
+    element.scrollIntoView({ behavior: "smooth", block: "center" });
+    ["mouseenter", "mouseover", "mousedown", "mouseup", "click"].forEach(eventType => {
+      element.dispatchEvent(new MouseEvent(eventType, {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      }));
     });
+    if (typeof element.click === "function") {
+      element.click();
+    }
   }
 
-  function randomDelay() {
-    return 1500 + Math.floor(Math.random() * 1501);
+  function isInViewport(element) {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 &&
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      Number(style.opacity) !== 0;
   }
 
-  function delay(milliseconds) {
-    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  function queryAllDeep(selector, root = document) {
+    let elements = [...root.querySelectorAll(selector)];
+    const walk = (node) => {
+      if (!node) return;
+      if (node.shadowRoot) {
+        elements.push(...node.shadowRoot.querySelectorAll(selector));
+        node.shadowRoot.querySelectorAll("*").forEach(walk);
+      }
+      const children = node.children || [];
+      for (let i = 0; i < children.length; i++) {
+        walk(children[i]);
+      }
+    };
+    walk(root);
+    return elements;
+  }
+
+  function normalizeText(text) {
+    return (text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   function reportStatus(text) {
